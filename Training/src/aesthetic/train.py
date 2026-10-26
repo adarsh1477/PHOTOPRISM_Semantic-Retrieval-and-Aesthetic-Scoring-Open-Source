@@ -29,6 +29,8 @@ from torch import nn
 import torch.nn.functional as F
 from torch.optim import Adam
 from torch.utils.data import DataLoader
+import psutil
+import subprocess
 
 from src.aesthetic.model import build_aesthetic_model
 from src.common.checkpointing import (
@@ -59,6 +61,23 @@ def get_device(device_str: str) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_str)
 
+def log_system_metrics(step: int):
+    import mlflow
+
+    mlflow.log_metric("cpu_percent", psutil.cpu_percent(), step=step)
+    mlflow.log_metric("ram_percent", psutil.virtual_memory().percent, step=step)
+
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showmemuse", "--showuse"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        mlflow.log_text(result.stdout, f"system/rocm_smi_epoch_{step}.txt")
+    except Exception as e:
+        mlflow.log_text(str(e), f"system/rocm_error_epoch_{step}.txt")
+
 def safe_collate(batch):
     batch = [item for item in batch if item is not None]
     if len(batch) == 0:
@@ -76,6 +95,42 @@ def compute_feedback_weights(
     weights = 1.0 + alpha * torch.log1p(counts.float())
     return torch.clamp(weights, max=max_weight)
 
+def adjust_targets_with_rank_feedback(
+    targets: torch.Tensor,
+    num_favourites: torch.Tensor,
+    avg_shown_rank: torch.Tensor,
+    rank_present: torch.Tensor,
+    good_rank_threshold: int,
+    low_favourite_threshold: int,
+    high_favourite_threshold: int,
+    good_rank_low_fav_penalty: float,
+    no_rank_high_fav_boost: float,
+    good_rank_high_fav_boost: float,
+) -> torch.Tensor:
+    adjusted_targets = targets.clone()
+
+    good_rank = rank_present & (avg_shown_rank <= good_rank_threshold)
+    low_favs = num_favourites <= low_favourite_threshold
+    high_favs = num_favourites >= high_favourite_threshold
+    no_rank = ~rank_present
+
+    adjusted_targets[good_rank & low_favs] = torch.clamp(
+        adjusted_targets[good_rank & low_favs] - good_rank_low_fav_penalty,
+        min=0.0,
+    )
+
+    adjusted_targets[no_rank & high_favs] = torch.clamp(
+        adjusted_targets[no_rank & high_favs] + no_rank_high_fav_boost,
+        max=10.0,
+    )
+
+    adjusted_targets[good_rank & high_favs] = torch.clamp(
+        adjusted_targets[good_rank & high_favs] + good_rank_high_fav_boost,
+        max=10.0,
+    )
+
+    return adjusted_targets
+
 def run_one_epoch(model, loader, criterion, optimizer, device, train: bool, config: dict):
     if train:
         model.train()
@@ -89,6 +144,13 @@ def run_one_epoch(model, loader, criterion, optimizer, device, train: bool, conf
     favourite_weight_alpha = config["training"].get("favourite_weight_alpha", 0.30)
     max_feedback_weight = config["training"].get("max_feedback_weight", 4.0)
 
+    good_rank_threshold = config["training"].get("good_rank_threshold", 5)
+    low_favourite_threshold = config["training"].get("low_favourite_threshold", 0)
+    high_favourite_threshold = config["training"].get("high_favourite_threshold", 2)
+    good_rank_low_fav_penalty = config["training"].get("good_rank_low_fav_penalty", 0.10)
+    no_rank_high_fav_boost = config["training"].get("no_rank_high_fav_boost", 0.10)
+    good_rank_high_fav_boost = config["training"].get("good_rank_high_fav_boost", 0.05)
+
     for batch in loader:
         if batch is None:
             continue
@@ -96,19 +158,42 @@ def run_one_epoch(model, loader, criterion, optimizer, device, train: bool, conf
         targets = batch["aesthetic_score"].to(device).float()
         num_favourites = batch["num_favourites"].to(device).float()
 
+        avg_shown_rank = batch["avg_shown_rank"].to(device).float()
+        rank_present = batch["rank_present"].to(device).bool()
+
         if train:
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(train):
             preds = model(images)
+
+            adjusted_targets = adjust_targets_with_rank_feedback(
+            targets=targets,
+            num_favourites=num_favourites,
+            avg_shown_rank=avg_shown_rank,
+            rank_present=rank_present,
+            good_rank_threshold=good_rank_threshold,
+            low_favourite_threshold=low_favourite_threshold,
+            high_favourite_threshold=high_favourite_threshold,
+            good_rank_low_fav_penalty=good_rank_low_fav_penalty,
+            no_rank_high_fav_boost=no_rank_high_fav_boost,
+            good_rank_high_fav_boost=good_rank_high_fav_boost,
+        )
+
             sample_weights = compute_feedback_weights(
                 num_favourites,
                 alpha=favourite_weight_alpha,
                 max_weight=max_feedback_weight,
             ).to(device)
 
-            per_sample_mse = F.mse_loss(preds, targets, reduction="none")
+            per_sample_mse = F.mse_loss(preds, adjusted_targets, reduction="none")
             sample_weights = sample_weights / sample_weights.mean().clamp_min(1e-8)
+
+            if per_sample_mse.ndim > sample_weights.ndim:
+                sample_weights = sample_weights.view(
+                    -1, *([1] * (per_sample_mse.ndim - 1))
+                )
+
             loss = (per_sample_mse * sample_weights).mean()
 
             if train:
@@ -193,8 +278,8 @@ def train_aesthetic_baseline(config_path: str) -> dict:
         config=config,
         image_size=config["model"]["image_size"],
         split="val",
-        start_index=17500,
-        max_records=50,
+        start_index=0,
+        max_records=2500,
     )
 
     print(f"Train samples: {len(train_dataset)}")
@@ -374,12 +459,21 @@ def train_aesthetic_baseline(config_path: str) -> dict:
     training_start_time = time.time()
 
     with start_run(experiment_name=config["experiment_name"]):
+        mlflow.enable_system_metrics_logging()
         log_config_params(config)
 
         mlflow.log_param("learning_rate", learning_rate)
         mlflow.log_param("batch_size", batch_size)
         mlflow.log_param("epochs", epochs)
         mlflow.log_param("weight_decay", weight_decay)
+        mlflow.log_param("favourite_weight_alpha", train_cfg.get("favourite_weight_alpha", 0.30))
+        mlflow.log_param("max_feedback_weight", train_cfg.get("max_feedback_weight", 4.0))
+        mlflow.log_param("good_rank_threshold", train_cfg.get("good_rank_threshold", 5))
+        mlflow.log_param("low_favourite_threshold", train_cfg.get("low_favourite_threshold", 0))
+        mlflow.log_param("high_favourite_threshold", train_cfg.get("high_favourite_threshold", 2))
+        mlflow.log_param("good_rank_low_fav_penalty", train_cfg.get("good_rank_low_fav_penalty", 0.10))
+        mlflow.log_param("no_rank_high_fav_boost", train_cfg.get("no_rank_high_fav_boost", 0.10))
+        mlflow.log_param("good_rank_high_fav_boost", train_cfg.get("good_rank_high_fav_boost", 0.05))
         mlflow.log_param("image_size", config["model"]["image_size"])
         mlflow.log_param("dataset_version", config["dataset"]["dataset_version"])
         mlflow.log_param("candidate_name", config.get("candidate_name", "unknown_candidate"))
@@ -488,6 +582,8 @@ def train_aesthetic_baseline(config_path: str) -> dict:
             epoch_duration_sec = time.time() - epoch_start_time
             print(f"Epoch {epoch} duration_sec: {epoch_duration_sec:.2f}")
             mlflow.log_metric("epoch_duration_sec", epoch_duration_sec, step=epoch)
+
+            log_system_metrics(epoch)
 
         history_file = None
         if config["output"].get("save_history", False):

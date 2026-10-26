@@ -79,6 +79,12 @@ class AestheticDataset(Dataset):
             "dataset_version": record["dataset_version"],
             "source_dataset": record["source_dataset"],
             "num_favourites": int(record.get("num_favourites", 0)),
+            "avg_shown_rank": (
+                float(record["avg_shown_rank"])
+                if record.get("avg_shown_rank") is not None
+                else 0.0
+                ),
+            "rank_present": record.get("avg_shown_rank")is not None,
             }
         
         except Exception as e:
